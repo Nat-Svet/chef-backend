@@ -1,7 +1,7 @@
 require('dotenv').config();
 
-const express = require('express');
 const cors = require('cors');
+const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -72,7 +72,24 @@ const SYSTEM_PROMPT = `Ты — оркестратор трёх ИИ-агент�
 - totalCost — число в рублях, не больше budget_limit.`;
 
 const app = express();
-app.use(cors());
+
+const corsOptions = {
+  origin: true,
+  methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Accept'],
+  optionsSuccessStatus: 204,
+};
+
+app.use(cors(corsOptions));
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', req.headers.origin || '*');
+  res.header('Access-Control-Allow-Methods', 'GET,HEAD,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 app.use(express.json({ limit: '1mb' }));
 
 app.get(['/', '/health'], (_req, res) => {
