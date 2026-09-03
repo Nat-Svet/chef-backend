@@ -4,7 +4,7 @@ const cors = require('cors');
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = Number(process.env.PORT) || 8080;
 const TIMEWEB_AI_URL = (process.env.TIMEWEB_AI_URL || 'https://api.timeweb.ai/v1').replace(/\/$/, '');
 const TIMEWEB_AI_KEY = process.env.TIMEWEB_AI_KEY;
 const MODEL_ALIASES = {
@@ -357,5 +357,5 @@ function normalizeMenu(aiJson, catalog, budgetLimit, fallbackStore) {
 }
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Chef API listening on http://0.0.0.0:${PORT}`);
+  console.log(`Chef API listening on http://0.0.0.0:${PORT} (PORT=${process.env.PORT ?? 'default'})`);
 });
