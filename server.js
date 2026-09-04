@@ -18,17 +18,12 @@ const TIMEWEB_AI_MODEL =
 const SUPABASE_URL = process.env.SUPABASE_URL || process.env.EXPO_PUBLIC_SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY;
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  throw new Error('Задайте SUPABASE_URL / EXPO_PUBLIC_SUPABASE_URL и ключ anon в .env');
-}
-
-if (!TIMEWEB_AI_KEY) {
-  throw new Error('Задайте TIMEWEB_AI_KEY в .env');
-}
-
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false },
-});
+const supabase =
+  SUPABASE_URL && SUPABASE_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      })
+    : null;
 
 const WEEK_DAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 
@@ -93,7 +88,13 @@ app.use((req, res, next) => {
 app.use(express.json({ limit: '1mb' }));
 
 app.get(['/', '/health'], (_req, res) => {
-  res.json({ ok: true, service: 'chef-v-karmane-api' });
+  res.status(200).json({
+    ok: true,
+    service: 'chef-v-karmane-api',
+    port: PORT,
+    hasSupabase: Boolean(supabase),
+    hasAiKey: Boolean(TIMEWEB_AI_KEY),
+  });
 });
 
 app.post('/api/generate-menu', async (req, res) => {
@@ -101,6 +102,18 @@ app.post('/api/generate-menu', async (req, res) => {
 
   if (!userId || typeof userId !== 'string') {
     return res.status(400).json({ error: 'Передайте { userId } — UUID профиля из таблицы profiles' });
+  }
+
+  if (!supabase) {
+    return res.status(500).json({
+      error: 'Не заданы SUPABASE_URL и SUPABASE_ANON_KEY в переменных Timeweb',
+    });
+  }
+
+  if (!TIMEWEB_AI_KEY) {
+    return res.status(500).json({
+      error: 'Не задан TIMEWEB_AI_KEY в переменных Timeweb',
+    });
   }
 
   try {
