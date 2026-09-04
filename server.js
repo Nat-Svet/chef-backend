@@ -195,7 +195,13 @@ app.post('/api/generate-menu', async (req, res) => {
       store_products: storeProducts,
     };
 
-    const aiRaw = await requestTimewebMenu(userPayload);
+    let aiRaw;
+    try {
+      aiRaw = await requestTimewebMenu(userPayload);
+    } catch (aiError) {
+      console.error('AI menu failed, using fallback:', aiError);
+      aiRaw = buildFallbackMenu(catalog, userPayload.profile.budget_limit, activeStore);
+    }
     const menu = normalizeMenu(aiRaw, catalog, userPayload.profile.budget_limit, activeStore);
 
     return res.json({
@@ -213,18 +219,24 @@ app.post('/api/generate-menu', async (req, res) => {
 });
 
 async function requestTimewebMenu(payload) {
+  const compactPayload = {
+    profile: payload.profile,
+    recipes: payload.recipes,
+    store_products: payload.store_products,
+  };
+
   const messages = [
     { role: 'system', content: SYSTEM_PROMPT },
     {
       role: 'user',
-      content: `Собери меню на неделю по данным:\n${JSON.stringify(payload)}\n\nВерни сразу финальный JSON, без рассуждений и без markdown.`,
+      content: `Собери меню на неделю по данным:\n${JSON.stringify(compactPayload)}\n\nОтветь одним валидным JSON-объектом. Без markdown, без текста до/после.`,
     },
   ];
 
   const baseBody = {
     model: TIMEWEB_AI_MODEL,
-    temperature: 0.1,
-    max_tokens: 8192,
+    temperature: 0,
+    max_tokens: 4096,
     messages,
   };
 
@@ -241,26 +253,36 @@ async function requestTimewebMenu(payload) {
   try {
     return extractMenuJson(body);
   } catch (firstError) {
+    const broken = extractRawContent(body) || '';
+    console.error('Invalid AI JSON, repairing. finish=', body.choices?.[0]?.finish_reason, broken.slice(0, 400));
+
     const repair = await callTimewebChat({
       model: TIMEWEB_AI_MODEL,
       temperature: 0,
-      max_tokens: 2048,
+      max_tokens: 4096,
+      response_format: { type: 'json_object' },
       messages: [
-        ...messages,
-        { role: 'assistant', content: extractRawContent(body) || '' },
+        {
+          role: 'system',
+          content:
+            'Ты исправляешь JSON. Верни только валидный JSON-объект с полями store, totalCost, nutrition, zeroWasteNotes, days (7 дней: Пн..Вс, breakfastId/lunchId/dinnerId).',
+        },
         {
           role: 'user',
-          content:
-            'Ответ невалиден. Верни ТОЛЬКО JSON-объект с полями store, totalCost, nutrition, zeroWasteNotes, days. Без текста вокруг.',
+          content: `Исправь в валидный JSON:\n${broken.slice(0, 6000)}`,
         },
       ],
     });
 
-    if (repair.error) {
-      throw firstError;
+    if (!repair.error) {
+      try {
+        return extractMenuJson(repair);
+      } catch {
+        /* fallback below */
+      }
     }
 
-    return extractMenuJson(repair);
+    throw firstError;
   }
 }
 
@@ -275,6 +297,7 @@ function extractRawContent(body) {
     return value.text || value.content || '';
   };
 
+  // content first — reasoning_content у DeepSeek часто не JSON
   return (pick(message.content) || pick(message.reasoning_content)).trim();
 }
 
@@ -306,18 +329,81 @@ async function callTimewebChat(payload) {
 function parseJsonContent(content) {
   const trimmed = String(content).trim();
   const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const raw = (fenced ? fenced[1] : trimmed).trim();
+  let raw = (fenced ? fenced[1] : trimmed).trim();
 
-  try {
-    return JSON.parse(raw);
-  } catch {
-    const start = raw.indexOf('{');
-    const end = raw.lastIndexOf('}');
-    if (start >= 0 && end > start) {
-      return JSON.parse(raw.slice(start, end + 1));
+  const start = raw.indexOf('{');
+  if (start > 0) raw = raw.slice(start);
+
+  const candidates = [raw, repairJsonText(raw)];
+  let lastError;
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate);
+    } catch (error) {
+      lastError = error;
     }
-    throw new Error('Модель вернула не JSON');
   }
+
+  throw lastError || new Error('Модель вернула не JSON');
+}
+
+function repairJsonText(text) {
+  let raw = String(text).trim();
+
+  // убираем висячие запятые перед } или ]
+  raw = raw.replace(/,\s*([}\]])/g, '$1');
+
+  // если обрезан — закрываем открытые скобки
+  const stack = [];
+  let inString = false;
+  let escaped = false;
+  for (const ch of raw) {
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{' || ch === '[') stack.push(ch === '{' ? '}' : ']');
+    else if (ch === '}' || ch === ']') stack.pop();
+  }
+  if (inString) raw += '"';
+  while (stack.length) raw += stack.pop();
+
+  raw = raw.replace(/,\s*([}\]])/g, '$1');
+  return raw;
+}
+
+function buildFallbackMenu(catalog, budgetLimit, store) {
+  const byMeal = {
+    завтрак: catalog.filter((item) => item.meal_type === 'завтрак'),
+    обед: catalog.filter((item) => item.meal_type === 'обед'),
+    ужин: catalog.filter((item) => item.meal_type === 'ужин'),
+  };
+
+  const pickId = (mealType, index) => {
+    const pool = byMeal[mealType].length ? byMeal[mealType] : catalog;
+    return Number(pool[index % pool.length].id);
+  };
+
+  return {
+    store,
+    totalCost: Math.max(0, Math.round(Number(budgetLimit) * 0.85)),
+    nutrition: null,
+    zeroWasteNotes: 'Резервное меню: ответ ИИ был повреждён, собрали рацион из каталога рецептов.',
+    days: WEEK_DAYS.map((day, index) => ({
+      day,
+      breakfastId: pickId('завтрак', index),
+      lunchId: pickId('обед', index),
+      dinnerId: pickId('ужин', index),
+    })),
+  };
 }
 
 function normalizeMenu(aiJson, catalog, budgetLimit, fallbackStore) {
