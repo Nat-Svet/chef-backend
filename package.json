@@ -7,13 +7,14 @@
     "node": ">=20"
   },
   "scripts": {
-    "start": "node server.js",
+    "start": "tsx server.js",
     "build": "node -v"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.114.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "tsx": "^4.23.15"
   }
 }

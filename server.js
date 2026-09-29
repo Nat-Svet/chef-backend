@@ -1,11 +1,12 @@
 require('dotenv').config();
+require('tsx/cjs');
 
 const cors = require('cors');
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
+const { generateMenuWithAgents } = require('./src/services/ai-agents.ts');
 
 const PORT = Number(process.env.PORT) || 8080;
-const TIMEWEB_AI_URL = (process.env.TIMEWEB_AI_URL || 'https://api.timeweb.ai/v1').replace(/\/$/, '');
 const TIMEWEB_AI_KEY = process.env.TIMEWEB_AI_KEY;
 const MODEL_ALIASES = {
   'deepseek-v4-flash': 'deepseek/deepseek-v4-flash',
@@ -26,45 +27,6 @@ const supabase =
     : null;
 
 const WEEK_DAYS = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
-
-const SYSTEM_PROMPT = `Ты — оркестратор трёх ИИ-агентов приложения «Шеф в Кармане». Работай строго по ролям и верни ОДИН JSON-объект без markdown и без комментариев.
-
-РОЛЬ 1. Агент-Диетолог
-- Фильтруй рецепты по diet_tags профиля (теги рецепта должны пересекаться с целями, если цели заданы).
-- Считай суммарное КБЖУ недели по выбранным блюдам (ккал, белки, жиры, углеводы на 1 порцию × 21 приём пищи).
-
-РОЛЬ 2. Агент-Шеф
-- Оставляй только блюда, чьи tags совместимы с equipment_tags профиля (нужная техника есть у пользователя).
-- Составь меню на 7 дней: завтрак, обед, ужин (ровно 21 слот).
-- Предпочитай неповторяющиеся recipe id. Если в каталоге меньше 21 уникального рецепта, чередуй доступные id, НЕ выдумывай новые id.
-- meal_type должен соответствовать слоту: завтрак / обед / ужин. Если подходящего типа нет — возьми ближайший допустимый id из каталога.
-
-РОЛЬ 3. Агент-Закупщик
-- Используй ТОЛЬКО товары store_products магазина pricing_store (если выбранный магазин без цен, бери переданный каталог).
-- Сопоставляй ингредиенты по search_term.
-- Считай корзину на 7 дней (1 порция на приём пищи), принцип Zero Waste: остаток упаковки идёт в другие блюда недели, не покупай лишние упаковки без нужды.
-- Итоговая стоимость (totalCost) СТРОГО <= budget_limit. Если не укладываешься — замени дорогие блюда на более дешёвые из каталога.
-
-ФОРМАТ ОТВЕТА (только JSON):
-{
-  "store": "Самокат",
-  "totalCost": 0,
-  "nutrition": { "kcal": 0, "protein": 0, "fat": 0, "carb": 0 },
-  "zeroWasteNotes": "кратко",
-  "days": [
-    {
-      "day": "Пн",
-      "breakfastId": 1,
-      "lunchId": 2,
-      "dinnerId": 3
-    }
-  ]
-}
-
-Правила JSON:
-- days: ровно 7 объектов, day строго: Пн, Вт, Ср, Чт, Пт, Сб, Вс.
-- breakfastId, lunchId, dinnerId — целые id из переданного каталога recipes.
-- totalCost — число в рублях, не больше budget_limit.`;
 
 const app = express();
 
@@ -195,18 +157,25 @@ app.post('/api/generate-menu', async (req, res) => {
       store_products: storeProducts,
     };
 
-    let aiRaw;
+    let menu;
+    let isFallback = false;
     try {
-      aiRaw = await requestTimewebMenu(userPayload);
-    } catch (aiError) {
-      console.error('AI menu failed, using fallback:', aiError);
-      aiRaw = buildFallbackMenu(catalog, userPayload.profile.budget_limit, activeStore);
+      menu = await generateMenuWithAgents(userPayload.profile, catalog, storeProducts);
+      console.log(`[ai_success_rate] ok userId=${userId} store=${activeStore}`);
+    } catch (agentsError) {
+      isFallback = true;
+      console.error(
+        `[ai_success_rate] fail userId=${userId} store=${activeStore} error=`,
+        agentsError instanceof Error ? agentsError.stack || agentsError.message : agentsError,
+      );
+      const fallback = buildFallbackMenu(catalog, userPayload.profile.budget_limit, activeStore);
+      menu = normalizeMenu(fallback, catalog, userPayload.profile.budget_limit, activeStore);
     }
-    const menu = normalizeMenu(aiRaw, catalog, userPayload.profile.budget_limit, activeStore);
 
     return res.json({
       userId,
       model: TIMEWEB_AI_MODEL,
+      isFallback,
       menu,
     });
   } catch (error) {
@@ -217,168 +186,6 @@ app.post('/api/generate-menu', async (req, res) => {
     });
   }
 });
-
-async function requestTimewebMenu(payload) {
-  const compactPayload = {
-    profile: payload.profile,
-    recipes: payload.recipes,
-    store_products: payload.store_products,
-  };
-
-  const messages = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    {
-      role: 'user',
-      content: `Собери меню на неделю по данным:\n${JSON.stringify(compactPayload)}\n\nОтветь одним валидным JSON-объектом. Без markdown, без текста до/после.`,
-    },
-  ];
-
-  const baseBody = {
-    model: TIMEWEB_AI_MODEL,
-    temperature: 0,
-    max_tokens: 4096,
-    messages,
-  };
-
-  let body = await callTimewebChat({ ...baseBody, response_format: { type: 'json_object' } });
-  if (body.error) {
-    body = await callTimewebChat(baseBody);
-  }
-
-  if (body.error) {
-    const details = body.error?.message || body.message || JSON.stringify(body);
-    throw new Error(`Timeweb AI: ${details}`);
-  }
-
-  try {
-    return extractMenuJson(body);
-  } catch (firstError) {
-    const broken = extractRawContent(body) || '';
-    console.error('Invalid AI JSON, repairing. finish=', body.choices?.[0]?.finish_reason, broken.slice(0, 400));
-
-    const repair = await callTimewebChat({
-      model: TIMEWEB_AI_MODEL,
-      temperature: 0,
-      max_tokens: 4096,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Ты исправляешь JSON. Верни только валидный JSON-объект с полями store, totalCost, nutrition, zeroWasteNotes, days (7 дней: Пн..Вс, breakfastId/lunchId/dinnerId).',
-        },
-        {
-          role: 'user',
-          content: `Исправь в валидный JSON:\n${broken.slice(0, 6000)}`,
-        },
-      ],
-    });
-
-    if (!repair.error) {
-      try {
-        return extractMenuJson(repair);
-      } catch {
-        /* fallback below */
-      }
-    }
-
-    throw firstError;
-  }
-}
-
-function extractRawContent(body) {
-  const message = body.choices?.[0]?.message || {};
-  const pick = (value) => {
-    if (!value) return '';
-    if (typeof value === 'string') return value;
-    if (Array.isArray(value)) {
-      return value.map((part) => part.text || part.content || '').join('\n');
-    }
-    return value.text || value.content || '';
-  };
-
-  // content first — reasoning_content у DeepSeek часто не JSON
-  return (pick(message.content) || pick(message.reasoning_content)).trim();
-}
-
-function extractMenuJson(body) {
-  const content = extractRawContent(body);
-  if (!content) {
-    throw new Error('Пустой ответ модели');
-  }
-  return parseJsonContent(content);
-}
-
-async function callTimewebChat(payload) {
-  const response = await fetch(`${TIMEWEB_AI_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${TIMEWEB_AI_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    return { error: body.error || { message: `HTTP ${response.status}` }, status: response.status };
-  }
-  return body;
-}
-
-function parseJsonContent(content) {
-  const trimmed = String(content).trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  let raw = (fenced ? fenced[1] : trimmed).trim();
-
-  const start = raw.indexOf('{');
-  if (start > 0) raw = raw.slice(start);
-
-  const candidates = [raw, repairJsonText(raw)];
-  let lastError;
-
-  for (const candidate of candidates) {
-    try {
-      return JSON.parse(candidate);
-    } catch (error) {
-      lastError = error;
-    }
-  }
-
-  throw lastError || new Error('Модель вернула не JSON');
-}
-
-function repairJsonText(text) {
-  let raw = String(text).trim();
-
-  // убираем висячие запятые перед } или ]
-  raw = raw.replace(/,\s*([}\]])/g, '$1');
-
-  // если обрезан — закрываем открытые скобки
-  const stack = [];
-  let inString = false;
-  let escaped = false;
-  for (const ch of raw) {
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === '\\') {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === '{' || ch === '[') stack.push(ch === '{' ? '}' : ']');
-    else if (ch === '}' || ch === ']') stack.pop();
-  }
-  if (inString) raw += '"';
-  while (stack.length) raw += stack.pop();
-
-  raw = raw.replace(/,\s*([}\]])/g, '$1');
-  return raw;
-}
 
 function buildFallbackMenu(catalog, budgetLimit, store) {
   const byMeal = {
