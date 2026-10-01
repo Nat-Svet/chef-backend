@@ -4,7 +4,7 @@ require('tsx/cjs');
 const cors = require('cors');
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
-const { generateMenuWithAgents } = require('./src/services/ai-agents.ts');
+const { generateMenuWithAgents, pickReplacementRecipe } = require('./src/services/ai-agents.ts');
 
 const PORT = Number(process.env.PORT) || 8080;
 const TIMEWEB_AI_KEY = process.env.TIMEWEB_AI_KEY;
@@ -59,6 +59,91 @@ app.get(['/', '/health'], (_req, res) => {
   });
 });
 
+/** Общая загрузка профиля + каталога рецептов + товаров выбранных магазинов.
+ *  Используется и генерацией меню, и точечной заменой одного блюда. */
+async function loadProfileAndCatalog(userId) {
+  const [profileResult, recipesResult, ingredientsResult, productsResult] = await Promise.all([
+    supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
+    supabase.from('recipes').select('id, title, cooking_time, meal_type, tags'),
+    supabase.from('recipe_ingredients').select('recipe_id, name, amount_grams, kcal, protein, fat, carb'),
+    supabase.from('store_products').select('store_name, search_term, product_title, price, sku_id, pack_weight_grams, in_stock'),
+  ]);
+
+  if (profileResult.error) throw profileResult.error;
+  if (recipesResult.error) throw recipesResult.error;
+  if (ingredientsResult.error) throw ingredientsResult.error;
+  if (productsResult.error) throw productsResult.error;
+
+  if (!profileResult.data) {
+    return { error: { status: 404, message: 'Профиль не найден' } };
+  }
+
+  const recipes = recipesResult.data || [];
+  if (recipes.length === 0) {
+    return { error: { status: 409, message: 'В таблице recipes нет блюд. Запустите npm run seed:recipes' } };
+  }
+
+  const catalog = recipes.map((recipe) => ({
+    id: recipe.id,
+    title: recipe.title,
+    cooking_time: recipe.cooking_time,
+    meal_type: recipe.meal_type,
+    tags: recipe.tags,
+    ingredients: (ingredientsResult.data || [])
+      .filter((item) => item.recipe_id === recipe.id)
+      .map((item) => ({
+        name: item.name,
+        grams: item.amount_grams,
+        kcal: item.kcal,
+        protein: item.protein,
+        fat: item.fat,
+        carb: item.carb,
+      })),
+  }));
+
+  // Если выбрано несколько магазинов — тянем товары сразу по всем, чтобы
+  // Закупщик мог сравнивать цены между сетями и выбирать выгоднее.
+  const selectedStores = profileResult.data.selected_stores?.length ? profileResult.data.selected_stores : ['Самокат'];
+  const compactProducts = (item) => ({
+    store: item.store_name,
+    search_term: item.search_term,
+    title: item.product_title,
+    price: item.price,
+    pack_g: item.pack_weight_grams,
+  });
+  const inStock = (item) => item.in_stock !== false;
+
+  let storeProducts = (productsResult.data || [])
+    .filter((item) => selectedStores.includes(item.store_name) && inStock(item))
+    .map(compactProducts);
+  let activeStores = selectedStores;
+
+  if (storeProducts.length === 0) {
+    const samokat = (productsResult.data || [])
+      .filter((item) => item.store_name === 'Самокат' && inStock(item))
+      .map(compactProducts);
+    if (samokat.length) {
+      storeProducts = samokat;
+      activeStores = ['Самокат'];
+    } else {
+      storeProducts = (productsResult.data || []).filter(inStock).map(compactProducts);
+      activeStores = [...new Set(storeProducts.map((p) => p.store))];
+      if (!activeStores.length) activeStores = selectedStores;
+    }
+  }
+
+  const profile = {
+    id: profileResult.data.id,
+    budget_limit: Number(profileResult.data.budget_limit),
+    selected_stores: profileResult.data.selected_stores || [],
+    pricing_store: activeStores[0] || 'Самокат',
+    diet_tags: profileResult.data.diet_tags || [],
+    equipment_tags: profileResult.data.equipment_tags || [],
+  };
+
+  return { profile, catalog, storeProducts };
+}
+
 app.post('/api/generate-menu', async (req, res) => {
   const userId = req.body?.userId;
 
@@ -79,97 +164,25 @@ app.post('/api/generate-menu', async (req, res) => {
   }
 
   try {
-    const [profileResult, recipesResult, ingredientsResult, productsResult] = await Promise.all([
-      supabase.from('profiles').select('*').eq('id', userId).maybeSingle(),
-      supabase.from('recipes').select('id, title, cooking_time, meal_type, tags'),
-      supabase.from('recipe_ingredients').select('recipe_id, name, amount_grams, kcal, protein, fat, carb'),
-      supabase.from('store_products').select('store_name, search_term, product_title, price, sku_id, pack_weight_grams, in_stock'),
-    ]);
-
-    if (profileResult.error) throw profileResult.error;
-    if (recipesResult.error) throw recipesResult.error;
-    if (ingredientsResult.error) throw ingredientsResult.error;
-    if (productsResult.error) throw productsResult.error;
-
-    if (!profileResult.data) {
-      return res.status(404).json({ error: 'Профиль не найден' });
+    const loaded = await loadProfileAndCatalog(userId);
+    if (loaded.error) {
+      return res.status(loaded.error.status).json({ error: loaded.error.message });
     }
-
-    const recipes = recipesResult.data || [];
-    if (recipes.length === 0) {
-      return res.status(409).json({ error: 'В таблице recipes нет блюд. Запустите npm run seed:recipes' });
-    }
-
-    const catalog = recipes.map((recipe) => ({
-      id: recipe.id,
-      title: recipe.title,
-      cooking_time: recipe.cooking_time,
-      meal_type: recipe.meal_type,
-      tags: recipe.tags,
-      ingredients: (ingredientsResult.data || [])
-        .filter((item) => item.recipe_id === recipe.id)
-        .map((item) => ({
-          name: item.name,
-          grams: item.amount_grams,
-          kcal: item.kcal,
-          protein: item.protein,
-          fat: item.fat,
-          carb: item.carb,
-        })),
-    }));
-
-    const preferredStore = profileResult.data.selected_stores?.[0] || 'Самокат';
-    const compactProducts = (item) => ({
-      store: item.store_name,
-      search_term: item.search_term,
-      title: item.product_title,
-      price: item.price,
-      pack_g: item.pack_weight_grams,
-    });
-    const inStock = (item) => item.in_stock !== false;
-    let storeProducts = (productsResult.data || [])
-      .filter((item) => item.store_name === preferredStore && inStock(item))
-      .map(compactProducts);
-    let activeStore = preferredStore;
-    if (storeProducts.length === 0) {
-      const samokat = (productsResult.data || [])
-        .filter((item) => item.store_name === 'Самокат' && inStock(item))
-        .map(compactProducts);
-      if (samokat.length) {
-        activeStore = 'Самокат';
-        storeProducts = samokat;
-      } else {
-        storeProducts = (productsResult.data || []).filter(inStock).map(compactProducts);
-        activeStore = storeProducts[0]?.store || preferredStore;
-      }
-    }
-
-    const userPayload = {
-      profile: {
-        id: profileResult.data.id,
-        budget_limit: Number(profileResult.data.budget_limit),
-        selected_stores: profileResult.data.selected_stores || [],
-        pricing_store: activeStore,
-        diet_tags: profileResult.data.diet_tags || [],
-        equipment_tags: profileResult.data.equipment_tags || [],
-      },
-      recipes: catalog,
-      store_products: storeProducts,
-    };
+    const { profile, catalog, storeProducts } = loaded;
 
     let menu;
     let isFallback = false;
     try {
-      menu = await generateMenuWithAgents(userPayload.profile, catalog, storeProducts);
-      console.log(`[ai_success_rate] ok userId=${userId} store=${activeStore}`);
+      menu = await generateMenuWithAgents(profile, catalog, storeProducts);
+      console.log(`[ai_success_rate] ok userId=${userId} store=${profile.pricing_store}`);
     } catch (agentsError) {
       isFallback = true;
       console.error(
-        `[ai_success_rate] fail userId=${userId} store=${activeStore} error=`,
+        `[ai_success_rate] fail userId=${userId} store=${profile.pricing_store} error=`,
         agentsError instanceof Error ? agentsError.stack || agentsError.message : agentsError,
       );
-      const fallback = buildFallbackMenu(catalog, userPayload.profile.budget_limit, activeStore);
-      menu = normalizeMenu(fallback, catalog, userPayload.profile.budget_limit, activeStore);
+      const fallback = buildFallbackMenu(catalog, profile.budget_limit, profile.pricing_store);
+      menu = normalizeMenu(fallback, catalog, profile.budget_limit, profile.pricing_store);
     }
 
     return res.json({
@@ -182,6 +195,42 @@ app.post('/api/generate-menu', async (req, res) => {
     console.error('generate-menu failed:', error);
     return res.status(502).json({
       error: 'Не удалось сгенерировать меню',
+      details: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+app.post('/api/regenerate-meal', async (req, res) => {
+  const { userId, mealType, excludeIds } = req.body || {};
+
+  if (!userId || typeof userId !== 'string') {
+    return res.status(400).json({ error: 'Передайте { userId }' });
+  }
+  if (!['завтрак', 'обед', 'ужин'].includes(mealType)) {
+    return res.status(400).json({ error: 'mealType должен быть завтрак/обед/ужин' });
+  }
+  if (!supabase) {
+    return res.status(500).json({ error: 'Не заданы SUPABASE_URL и SUPABASE_ANON_KEY в переменных Timeweb' });
+  }
+
+  try {
+    const loaded = await loadProfileAndCatalog(userId);
+    if (loaded.error) {
+      return res.status(loaded.error.status).json({ error: loaded.error.message });
+    }
+
+    const exclude = Array.isArray(excludeIds) ? excludeIds.map(Number).filter(Number.isFinite) : [];
+    const recipeId = pickReplacementRecipe(loaded.profile, loaded.catalog, mealType, exclude);
+
+    if (recipeId === null) {
+      return res.status(409).json({ error: 'Нет подходящих блюд под текущие фильтры' });
+    }
+
+    return res.json({ recipeId });
+  } catch (error) {
+    console.error('regenerate-meal failed:', error);
+    return res.status(502).json({
+      error: 'Не удалось подобрать замену',
       details: error instanceof Error ? error.message : String(error),
     });
   }
@@ -201,9 +250,11 @@ function buildFallbackMenu(catalog, budgetLimit, store) {
 
   return {
     store,
+    stores: [store],
     totalCost: Math.max(0, Math.round(Number(budgetLimit) * 0.85)),
     nutrition: null,
     zeroWasteNotes: 'Резервное меню: ответ ИИ был повреждён, собрали рацион из каталога рецептов.',
+    scarcityNotice: null,
     days: WEEK_DAYS.map((day, index) => ({
       day,
       breakfastId: pickId('завтрак', index),
@@ -255,9 +306,11 @@ function normalizeMenu(aiJson, catalog, budgetLimit, fallbackStore) {
 
   return {
     store: aiJson.store || fallbackStore,
+    stores: Array.isArray(aiJson.stores) && aiJson.stores.length ? aiJson.stores : [aiJson.store || fallbackStore],
     totalCost,
     nutrition: aiJson.nutrition || null,
     zeroWasteNotes: aiJson.zeroWasteNotes || aiJson.zero_waste_notes || '',
+    scarcityNotice: aiJson.scarcityNotice ?? null,
     days,
   };
 }
