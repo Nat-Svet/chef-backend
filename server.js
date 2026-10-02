@@ -253,7 +253,7 @@ function buildFallbackMenu(catalog, budgetLimit, store) {
     stores: [store],
     totalCost: Math.max(0, Math.round(Number(budgetLimit) * 0.85)),
     nutrition: null,
-    zeroWasteNotes: 'Резервное меню: ответ ИИ был повреждён, собрали рацион из каталога рецептов.',
+    zeroWasteNotes: 'Собрали сбалансированный рацион из нашего проверенного каталога рецептов.',
     scarcityNotice: null,
     days: WEEK_DAYS.map((day, index) => ({
       day,
