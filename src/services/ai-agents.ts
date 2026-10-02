@@ -58,7 +58,17 @@ export type GeneratedMenuPayload = {
 };
 
 const WEEK_DAYS: WeekDay[] = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
-const EQUIPMENT = ['Плита', 'Духовка', 'Мультиварка'];
+const NO_COOK = 'Без готовки';
+const EQUIPMENT = [
+  'Плита',
+  'Духовка',
+  'Мультиварка',
+  'Микроволновка',
+  'Блендер / Миксер',
+  'Электрогриль / Аэрогриль',
+  'Тостер',
+  NO_COOK,
+];
 
 const DEEPSEEK_URL = (process.env.TIMEWEB_AI_URL || 'https://api.timeweb.ai/v1').replace(/\/$/, '');
 const DEEPSEEK_KEY = process.env.TIMEWEB_AI_KEY || '';
@@ -225,10 +235,11 @@ days — ровно 7 объектов, day строго: Пн, Вт, Ср, Чт
   }
 }
 
+/** Блюдо подходит, если у пользователя есть ВСЯ нужная ему техника (рецепт
+ *  может требовать сразу плиту и блендер). «Без готовки» техники не требует. */
 function isEquipmentCompatible(recipe: CatalogRecipe, equipmentTags: string[]): boolean {
-  const required = recipe.tags.filter((tag) => EQUIPMENT.includes(tag));
-  if (required.length === 0) return true;
-  return required.some((tag) => equipmentTags.includes(tag));
+  const required = recipe.tags.filter((tag) => EQUIPMENT.includes(tag) && tag !== NO_COOK);
+  return required.every((tag) => equipmentTags.includes(tag));
 }
 
 /** Пул на каждый meal_type строится независимо и СТРОГО: техника сужает
@@ -413,9 +424,9 @@ function buildShoppingItems(
 
 function guessCategory(name: string): ShoppingCategory {
   const lower = name.toLowerCase();
-  if (/(филе|курин|мясо|фарш)/.test(lower)) return 'Мясо и птица';
-  if (/(молоко|йогурт|сыр|творог)/.test(lower)) return 'Молочные продукты';
-  if (/(ягод|овощ|перец|кабач|томат|морков|лук|брокколи)/.test(lower)) return 'Овощи и фрукты';
+  if (/(яйц|молок|йогурт|сыр|творог|кефир|сливк|сметан|сливочн|моцарелл)/.test(lower)) return 'Молочные продукты';
+  if (/(филе|курин|бёдр|крыл|фарш|мясо|говяд|свинин|индейк|ветчин|сосиск|лосос|сёмг|тунец|треск|минтай|кальмар|креветк)/.test(lower)) return 'Мясо и птица';
+  if (/(ягод|овощ|перец|кабач|томат|помидор|морков|лук|брокколи|картоф|капуст|свёкл|тыкв|баклаж|гриб|шампин|огурц|шпинат|салат|руккол|чеснок|зелень|лимон|яблок|банан|авокадо)/.test(lower)) return 'Овощи и фрукты';
   return 'Бакалея';
 }
 
