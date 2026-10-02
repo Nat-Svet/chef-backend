@@ -194,7 +194,7 @@ app.post('/api/generate-menu', async (req, res) => {
 });
 
 app.post('/api/regenerate-meal', async (req, res) => {
-  const { userId, mealType, excludeIds, rejectedIds, siblingIds } = req.body || {};
+  const { userId, mealType, excludeIds, rejectedIds, siblingIds, menuIds, slotIndex, portions } = req.body || {};
 
   if (!userId || typeof userId !== 'string') {
     return res.status(400).json({ error: 'Передайте { userId }' });
@@ -221,6 +221,12 @@ app.post('/api/regenerate-meal', async (req, res) => {
       exclude,
       toIds(rejectedIds),
       toIds(siblingIds),
+      {
+        menuIds: toIds(menuIds),
+        slotIndex: Math.min(20, Math.max(0, Math.round(Number(slotIndex) || 0))),
+        portions: Math.min(20, Math.max(1, Math.round(Number(portions) || 1))),
+        storeProducts: loaded.storeProducts,
+      },
     );
 
     if (recipeId === null) {
@@ -256,6 +262,7 @@ function buildFallbackMenu(catalog, budgetLimit, store) {
     nutrition: null,
     zeroWasteNotes: 'Собрали сбалансированный рацион из нашего проверенного каталога рецептов.',
     scarcityNotice: null,
+    budgetNotice: null,
     days: WEEK_DAYS.map((day, index) => ({
       day,
       breakfastId: pickId('завтрак', index),
@@ -312,6 +319,7 @@ function normalizeMenu(aiJson, catalog, budgetLimit, fallbackStore) {
     nutrition: aiJson.nutrition || null,
     zeroWasteNotes: aiJson.zeroWasteNotes || aiJson.zero_waste_notes || '',
     scarcityNotice: aiJson.scarcityNotice ?? null,
+    budgetNotice: aiJson.budgetNotice ?? null,
     days,
   };
 }

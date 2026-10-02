@@ -46,7 +46,20 @@ export type AgentProfile = {
 };
 
 export type MenuDay = { day: WeekDay; breakfastId: number; lunchId: number; dinnerId: number };
-export type ShoppingItem = { name: string; grams: number; category: ShoppingCategory; price: number; store: string };
+export type ShoppingItem = {
+  name: string;
+  /** Сколько граммов реально нужно на неделю. */
+  grams: number;
+  category: ShoppingCategory;
+  /** Цена целых упаковок: packs × цена упаковки. */
+  price: number;
+  store: string;
+  /** Число целых упаковок к покупке (0 — товар не найден в каталоге, цена оценочная). */
+  packs: number;
+  /** Вес одной упаковки, г. */
+  packGrams: number;
+  packTitle: string;
+};
 
 export type GeneratedMenuPayload = {
   store: string;
@@ -55,6 +68,8 @@ export type GeneratedMenuPayload = {
   nutrition: { kcal: number; protein: number; fat: number; carb: number } | null;
   zeroWasteNotes: string;
   scarcityNotice: string | null;
+  /** Заполняется, только если при заданном бюджете и фильтрах уложиться в лимит невозможно. */
+  budgetNotice: string | null;
   days: MenuDay[];
   shoppingItems: ShoppingItem[];
 };
@@ -203,11 +218,27 @@ async function runDietitianAgent(profile: AgentProfile, catalog: CatalogRecipe[]
 
 const MEAL_TYPES: MealType[] = ['завтрак', 'обед', 'ужин'];
 
-export type ChefResult = { days: MenuDay[]; scarcity: { isScarce: boolean; availableCount: number } };
+export type ChefResult = {
+  days: MenuDay[];
+  scarcity: { isScarce: boolean; availableCount: number };
+  /** Полные (до сужения по бюджету) пулы слотов — для подгонки под лимит. */
+  pools: Record<MealType, CatalogRecipe[]>;
+};
 
-async function runChefAgent(profile: AgentProfile, catalog: CatalogRecipe[], allowedIds: number[]): Promise<ChefResult> {
-  const mealPools = buildMealPools(catalog, allowedIds, profile.equipment_tags);
-  const scarcity = computeScarcity(mealPools);
+async function runChefAgent(
+  profile: AgentProfile,
+  catalog: CatalogRecipe[],
+  allowedIds: number[],
+  pricer: Pricer,
+): Promise<ChefResult> {
+  const fullPools = buildMealPools(catalog, allowedIds, profile.equipment_tags);
+  const scarcity = computeScarcity(fullPools);
+  // Бюджет от обратного: потолок цены порции в слоте = бюджет / (21 × человек).
+  const slotBudget = slotBudgetFor(profile.budget_limit, Math.max(1, Math.round(profile.portions ?? 1)));
+  const mealPools = {} as Record<MealType, CatalogRecipe[]>;
+  for (const type of MEAL_TYPES) {
+    mealPools[type] = profile.budget_limit > 0 ? narrowPoolByBudget(fullPools[type], pricer, slotBudget) : fullPools[type];
+  }
   const compact = MEAL_TYPES.flatMap((type) =>
     mealPools[type].map((r) => ({ id: r.id, meal_type: r.meal_type, tags: r.tags, cooking_time: r.cooking_time })),
   );
@@ -231,9 +262,9 @@ days — ровно 7 объектов, day строго: Пн, Вт, Ср, Чт
       { role: 'system', content: system },
       { role: 'user', content: user },
     ]);
-    return { days: planWeek(result.days, mealPools, catalog), scarcity };
+    return { days: planWeek(result.days, mealPools, catalog), scarcity, pools: fullPools };
   } catch {
-    return { days: planWeek([], mealPools, catalog), scarcity };
+    return { days: planWeek([], mealPools, catalog), scarcity, pools: fullPools };
   }
 }
 
@@ -486,63 +517,207 @@ async function runBuyerAgent(
   }
 }
 
-function buildShoppingItems(
-  days: MenuDay[],
-  catalog: CatalogRecipe[],
-  storeProducts: StoreProductCompact[],
-  fallbackStore: string,
-  portions: number,
-): { items: ShoppingItem[]; totalCost: number } {
+// ---------- Корзина из целых упаковок ----------
+
+type Basket = {
+  items: ShoppingItem[];
+  /** Реальная стоимость: целые упаковки × цена упаковки. */
+  totalCost: number;
+  /** Пропорциональная оценка (граммы × цена за грамм) — только для сравнения вариантов. */
+  proportionalCost: number;
+};
+
+type Pricer = {
+  basket: (ids: number[], portions: number) => Basket;
+  /** Оценка стоимости одной порции блюда по цене за грамм (без округления до упаковок). */
+  portionCost: (recipe: CatalogRecipe) => number;
+};
+
+function perGramPrice(p: StoreProductCompact): number {
+  return Number(p.price) / (p.pack_g && p.pack_g > 0 ? p.pack_g : 1);
+}
+
+/** Среди совпадений по названию берём самую дешёвую за грамм упаковку. */
+function matchProduct(name: string, storeProducts: StoreProductCompact[]): StoreProductCompact | undefined {
+  const needle = name.toLowerCase();
+  const candidates = storeProducts.filter((p) => {
+    const term = p.search_term.toLowerCase();
+    return term === needle || needle.includes(term) || term.includes(needle);
+  });
+  if (!candidates.length) return undefined;
+  return candidates.reduce((best, cur) => (perGramPrice(cur) < perGramPrice(best) ? cur : best));
+}
+
+function createPricer(catalog: CatalogRecipe[], storeProducts: StoreProductCompact[], fallbackStore: string): Pricer {
   const recipeById = new Map(catalog.map((r) => [r.id, r]));
-  const counts = new Map<number, number>();
-  for (const day of days) {
-    for (const id of [day.breakfastId, day.lunchId, day.dinnerId]) {
-      counts.set(id, (counts.get(id) ?? 0) + 1);
-    }
-  }
-
-  const gramsByName = new Map<string, number>();
-  for (const [id, times] of counts) {
-    const recipe = recipeById.get(id);
-    if (!recipe) continue;
-    for (const ing of recipe.ingredients) {
-      gramsByName.set(ing.name, (gramsByName.get(ing.name) ?? 0) + ing.grams * times * portions);
-    }
-  }
-
-  // storeProducts — каталог ОДНОГО магазина. Если в нём несколько позиций с одним
-  // названием, берём самую дешёвую за грамм.
-  const matchProduct = (name: string) => {
-    const needle = name.toLowerCase();
-    const candidates = storeProducts.filter(
-      (p) =>
-        p.search_term.toLowerCase() === needle ||
-        needle.includes(p.search_term.toLowerCase()) ||
-        p.search_term.toLowerCase().includes(needle),
-    );
-    if (!candidates.length) return undefined;
-    return candidates.reduce((best, cur) => {
-      const bestPerGram = best.price / (best.pack_g && best.pack_g > 0 ? best.pack_g : 1);
-      const curPerGram = cur.price / (cur.pack_g && cur.pack_g > 0 ? cur.pack_g : 1);
-      return curPerGram < bestPerGram ? cur : best;
-    });
+  const productCache = new Map<string, StoreProductCompact | undefined>();
+  const productFor = (name: string) => {
+    if (!productCache.has(name)) productCache.set(name, matchProduct(name, storeProducts));
+    return productCache.get(name);
   };
 
-  const raw = [...gramsByName.entries()].map(([name, grams]) => {
-    const product = matchProduct(name);
-    const packGrams = product?.pack_g && product.pack_g > 0 ? product.pack_g : grams;
-    const packs = product ? Math.max(1, Math.ceil(grams / packGrams)) : 1;
-    const price = product ? packs * Number(product.price) : Math.max(1, Math.round(grams * 0.15));
-    return { name, grams, category: guessCategory(name), price, store: product?.store ?? fallbackStore };
-  });
+  const basket = (ids: number[], portions: number): Basket => {
+    const counts = new Map<number, number>();
+    for (const id of ids) counts.set(id, (counts.get(id) ?? 0) + 1);
 
-  // Стоимость — ровно по каталогу магазина: упаковки × цена, без подгонки под бюджет.
-  const items = raw
-    .map((item) => ({ ...item, price: Math.max(1, Math.round(item.price)) }))
-    .sort((x, y) => x.name.localeCompare(y.name, 'ru'));
+    // Граммы суммируются по товару магазина: два ингредиента с одной и той же
+    // упаковкой делят её, а не покупают по пачке каждый.
+    type Line = { names: string[]; grams: number; product?: StoreProductCompact };
+    const lines = new Map<string, Line>();
+    for (const [id, times] of counts) {
+      const recipe = recipeById.get(id);
+      if (!recipe) continue;
+      for (const ing of recipe.ingredients) {
+        const product = productFor(ing.name);
+        const key = product ? `p:${product.title}` : `n:${ing.name}`;
+        const line = lines.get(key) ?? { names: [], grams: 0, product };
+        if (!line.names.includes(ing.name)) line.names.push(ing.name);
+        line.grams += ing.grams * times * portions;
+        lines.set(key, line);
+      }
+    }
 
-  const totalCost = items.reduce((sum, item) => sum + item.price, 0);
-  return { items, totalCost };
+    let proportionalCost = 0;
+    const items: ShoppingItem[] = [...lines.values()].map(({ names, grams, product }) => {
+      const name = names.length === 1 ? names[0] : (product?.search_term ?? names[0]);
+      if (!product) {
+        const price = Math.max(1, Math.round(grams * 0.15));
+        proportionalCost += price;
+        return { name, grams, category: guessCategory(name), price, store: fallbackStore, packs: 0, packGrams: 0, packTitle: '' };
+      }
+      const packGrams = product.pack_g && product.pack_g > 0 ? product.pack_g : grams;
+      const packs = Math.max(1, Math.ceil(grams / packGrams - 1e-9));
+      proportionalCost += grams * perGramPrice(product);
+      return {
+        name,
+        grams,
+        category: guessCategory(name),
+        price: Math.round(packs * Number(product.price)),
+        store: product.store,
+        packs,
+        packGrams,
+        packTitle: product.title,
+      };
+    });
+
+    items.sort((x, y) => x.name.localeCompare(y.name, 'ru'));
+    return { items, totalCost: items.reduce((sum, item) => sum + item.price, 0), proportionalCost };
+  };
+
+  const portionCost = (recipe: CatalogRecipe) =>
+    recipe.ingredients.reduce((sum, ing) => {
+      const product = productFor(ing.name);
+      return sum + (product ? ing.grams * perGramPrice(product) : ing.grams * 0.15);
+    }, 0);
+
+  return { basket, portionCost };
+}
+
+// ---------- Бюджет: недельный лимит — жёсткий ----------
+
+function daysToIds(days: MenuDay[]): number[] {
+  return days.flatMap((d) => [d.breakfastId, d.lunchId, d.dinnerId]);
+}
+
+function idsToDays(ids: number[]): MenuDay[] {
+  return WEEK_DAYS.map((day, i) => ({
+    day,
+    breakfastId: ids[i * 3],
+    lunchId: ids[i * 3 + 1],
+    dinnerId: ids[i * 3 + 2],
+  }));
+}
+
+/** Бюджет «от обратного»: бюджет / (21 слот × число человек) — потолок стоимости одной порции в слоте. */
+export function slotBudgetFor(budget: number, portions: number): number {
+  return budget / (21 * Math.max(1, portions));
+}
+
+/** Сужает пул слота до блюд, чья порция укладывается в слотовый бюджет (с запасом на общие упаковки).
+ *  Если таких меньше семи — берём семь самых дешёвых, чтобы неделя осталась без повторов. */
+function narrowPoolByBudget(pool: CatalogRecipe[], pricer: Pricer, slotBudget: number): CatalogRecipe[] {
+  const priced = pool.map((r) => ({ r, cost: pricer.portionCost(r) })).sort((a, b) => a.cost - b.cost);
+  const affordable = priced.filter((p) => p.cost <= slotBudget * 1.3);
+  const chosen = affordable.length >= 7 ? affordable : priced.slice(0, Math.min(7, priced.length));
+  return chosen.map((p) => p.r);
+}
+
+/** Подгоняет неделю под лимит: пока реальная стоимость (целые упаковки) выше бюджета,
+ *  делает лучшую замену одного блюда на более дешёвое из полного пула слота, не ломая
+ *  разнообразие дня. Сначала без повторов блюд за неделю, затем — если иначе никак — с повторами. */
+function fitMenuToBudget(
+  days: MenuDay[],
+  pools: Record<MealType, CatalogRecipe[]>,
+  catalog: CatalogRecipe[],
+  pricer: Pricer,
+  budget: number,
+  portions: number,
+): { days: MenuDay[]; totalCost: number } {
+  const info = new Map(catalog.map((r) => [r.id, dishInfo(r)]));
+  const ids = daysToIds(days);
+  const evaluate = (list: number[]) => {
+    const b = pricer.basket(list, portions);
+    return { total: b.totalCost, score: b.totalCost + 0.05 * b.proportionalCost };
+  };
+
+  let current = evaluate(ids);
+
+  for (const allowRepeats of [false, true]) {
+    for (let iter = 0; iter < 80 && current.total > budget; iter += 1) {
+      let bestMove: { slot: number; id: number } | null = null;
+      let bestEval = current;
+
+      for (let slot = 0; slot < 21; slot += 1) {
+        const type = MEAL_TYPES[slot % 3];
+        const dayStart = Math.floor(slot / 3) * 3;
+        const mates = [0, 1, 2].filter((k) => dayStart + k !== slot).map((k) => dayStart + k);
+        for (const candidate of pools[type]) {
+          if (candidate.id === ids[slot]) continue;
+          if (!allowRepeats && ids.includes(candidate.id)) continue;
+          if (mates.some((m) => clash(info.get(candidate.id), info.get(ids[m])))) continue;
+
+          const previous = ids[slot];
+          ids[slot] = candidate.id;
+          const next = evaluate(ids);
+          ids[slot] = previous;
+          if (next.score < bestEval.score - 1e-6) {
+            bestEval = next;
+            bestMove = { slot, id: candidate.id };
+          }
+        }
+      }
+
+      if (!bestMove) break;
+      ids[bestMove.slot] = bestMove.id;
+      current = bestEval;
+    }
+    if (current.total <= budget) break;
+  }
+
+  return { days: idsToDays(ids), totalCost: current.total };
+}
+
+function buildBudgetNotice(budget: number, minCost: number, portions: number): string {
+  const people = portions === 1 ? 'одного человека' : `${portions} чел.`;
+  return `На ${people} и ваши настройки мы подобрали самое выгодное меню — ${minCost.toLocaleString('ru-RU')} ₽. Это больше лимита ${budget.toLocaleString('ru-RU')} ₽: чтобы уложиться, увеличьте бюджет или смягчите фильтры.`;
+}
+
+/** Для кнопки «Заменить блюдо»: из кандидатов оставляем те, с которыми вся неделя остаётся в бюджете;
+ *  если таких нет — самые дешёвые по итоговому чеку. */
+function filterByWeekBudget(
+  candidates: CatalogRecipe[],
+  ctx: { menuIds: number[]; slotIndex: number; portions: number; budget: number; pricer: Pricer },
+): CatalogRecipe[] {
+  const costWith = (id: number) => {
+    const ids = [...ctx.menuIds];
+    ids[ctx.slotIndex] = id;
+    return ctx.pricer.basket(ids, ctx.portions).totalCost;
+  };
+  const costed = candidates.map((r) => ({ r, cost: costWith(r.id) }));
+  const within = costed.filter((c) => c.cost <= ctx.budget);
+  if (within.length) return within.map((c) => c.r);
+  const cheapest = Math.min(...costed.map((c) => c.cost));
+  return costed.filter((c) => c.cost === cheapest).map((c) => c.r);
 }
 
 function guessCategory(name: string): ShoppingCategory {
@@ -589,16 +764,25 @@ export async function generateMenuWithAgents(
 ): Promise<GeneratedMenuPayload> {
   if (catalog.length === 0) throw new Error('Каталог рецептов пуст');
 
+  const portions = Math.max(1, Math.round(profile.portions ?? 1));
+  const pricer = createPricer(catalog, storeProducts, profile.pricing_store);
+
   const filteredIds = await runDietitianAgent(profile, catalog);
-  const { days, scarcity } = await runChefAgent(profile, catalog, filteredIds);
+  const chef = await runChefAgent(profile, catalog, filteredIds, pricer);
+  const scarcity = chef.scarcity;
+
+  // Закупщик: стоимость — целые упаковки; недельный бюджет — жёсткий лимит.
+  const fitted =
+    profile.budget_limit > 0
+      ? fitMenuToBudget(chef.days, chef.pools, catalog, pricer, profile.budget_limit, portions)
+      : { days: chef.days, totalCost: pricer.basket(daysToIds(chef.days), portions).totalCost };
+  const days = fitted.days;
   const { zeroWasteNotes } = await runBuyerAgent(profile, days, catalog, storeProducts);
-  const { items, totalCost } = buildShoppingItems(
-    days,
-    catalog,
-    storeProducts,
-    profile.pricing_store,
-    Math.max(1, Math.round(profile.portions ?? 1)),
-  );
+  const { items, totalCost } = pricer.basket(daysToIds(days), portions);
+  const budgetNotice =
+    profile.budget_limit > 0 && totalCost > profile.budget_limit
+      ? buildBudgetNotice(profile.budget_limit, totalCost, portions)
+      : null;
   const nutrition = computeNutrition(days, catalog);
   const stores = [...new Set(items.map((item) => item.store))];
 
@@ -609,6 +793,7 @@ export async function generateMenuWithAgents(
     nutrition,
     zeroWasteNotes,
     scarcityNotice: scarcity.isScarce ? buildScarcityNotice(scarcity.availableCount) : null,
+    budgetNotice,
     days,
     shoppingItems: items,
   };
@@ -627,6 +812,7 @@ export function pickReplacementRecipe(
   usedIds: number[],
   rejectedIds: number[] = [],
   siblingIds: number[] = [],
+  budgetCtx?: { menuIds: number[]; slotIndex: number; portions: number; storeProducts: StoreProductCompact[] },
 ): number | null {
   const allowedIds = new Set(filterByDiet(catalog, profile.diet_tags));
   const byDiet = catalog.filter((r) => r.meal_type === mealType && allowedIds.has(r.id));
@@ -643,10 +829,25 @@ export function pickReplacementRecipe(
   const diverse = (r: CatalogRecipe) => !siblings.some((s) => clash(dishInfo(r), s));
   const pickOne = (items: CatalogRecipe[]) => items[Math.floor(Math.random() * items.length)].id;
 
+  // Недельный бюджет — жёсткий лимит и для замены: берём только блюда, с которыми чек недели не выходит за него.
+  const affordable =
+    budgetCtx && profile.budget_limit > 0 && budgetCtx.menuIds.length === 21
+      ? new Set(
+          filterByWeekBudget(pool, {
+            menuIds: budgetCtx.menuIds,
+            slotIndex: budgetCtx.slotIndex,
+            portions: Math.max(1, Math.round(budgetCtx.portions)),
+            budget: profile.budget_limit,
+            pricer: createPricer(catalog, budgetCtx.storeProducts, profile.pricing_store),
+          }).map((r) => r.id),
+        )
+      : null;
+  const budgetPool = affordable ? pool.filter((r) => affordable.has(r.id)) : pool;
+
   const tiers = [
-    pool.filter((r) => !used.has(r.id) && !rejected.has(r.id)),
-    pool.filter((r) => !rejected.has(r.id)),
-    pool,
+    budgetPool.filter((r) => !used.has(r.id) && !rejected.has(r.id)),
+    budgetPool.filter((r) => !rejected.has(r.id)),
+    budgetPool,
   ];
 
   for (const tier of tiers) {
