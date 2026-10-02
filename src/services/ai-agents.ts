@@ -41,6 +41,8 @@ export type AgentProfile = {
   pricing_store: string;
   diet_tags: string[];
   equipment_tags: string[];
+  /** Сколько порций (человек) нужно купить; по умолчанию 1. */
+  portions?: number;
 };
 
 export type MenuDay = { day: WeekDay; breakfastId: number; lunchId: number; dinnerId: number };
@@ -157,7 +159,7 @@ async function callWithRetry(messages: ChatMessage[], attempts = 2): Promise<any
 // Строгая фильтрация: рецепт подходит, только если хотя бы один его tag есть
 // в diet_tags пользователя. Никакого "подмешивания" непрофильных блюд, даже
 // если подходящих рецептов мало — дефицит обрабатывается выше по стеку
-// (normalizeDays повторяет уже отобранные блюда, а не ослабляет фильтр).
+// (planWeek повторяет уже отобранные блюда, а не ослабляет фильтр).
 function filterByDiet(catalog: CatalogRecipe[], dietTags: string[]): number[] {
   if (dietTags.length === 0) return catalog.map((r) => r.id);
   return catalog.filter((r) => r.tags.some((tag) => dietTags.includes(tag))).map((r) => r.id);
@@ -215,8 +217,8 @@ async function runChefAgent(profile: AgentProfile, catalog: CatalogRecipe[], all
 Правила:
 1. Используй ТОЛЬКО id из переданного списка recipes, не выдумывай новые и не бери id другого meal_type.
 2. meal_type блюда обязан соответствовать слоту (завтрак/обед/ужин).
-3. Максимизируй уникальность: пока в списке есть неиспользованный на этой неделе id нужного meal_type — используй его, а не повторяй прежний.
-4. Повторяй блюдо только если все доступные id этого meal_type уже использованы.
+3. Все 21 блюда недели должны быть РАЗНЫМИ id — не повторяй рецепт.
+4. В рамках ОДНОГО дня не бери блюда с одинаковым главным белком (курица, говядина, рыба, яйца…) или одинаковым гарниром (гречка, рис, макароны, картофель…).
 Верни СТРОГО один JSON без markdown:
 {"days":[{"day":"Пн","breakfastId":1,"lunchId":2,"dinnerId":3}]}
 days — ровно 7 объектов, day строго: Пн, Вт, Ср, Чт, Пт, Сб, Вс.`;
@@ -229,9 +231,9 @@ days — ровно 7 объектов, day строго: Пн, Вт, Ср, Чт
       { role: 'system', content: system },
       { role: 'user', content: user },
     ]);
-    return { days: normalizeDays(result.days, mealPools, catalog), scarcity };
+    return { days: planWeek(result.days, mealPools, catalog), scarcity };
   } catch {
-    return { days: normalizeDays([], mealPools, catalog), scarcity };
+    return { days: planWeek([], mealPools, catalog), scarcity };
   }
 }
 
@@ -269,53 +271,182 @@ function computeScarcity(mealPools: Record<MealType, CatalogRecipe[]>): { isScar
   return { isScarce, availableCount };
 }
 
-function normalizeDays(
-  rawDays: unknown,
-  mealPools: Record<MealType, CatalogRecipe[]>,
-  catalog: CatalogRecipe[],
-): MenuDay[] {
-  const typeById = new Map(catalog.map((r) => [r.id, r.meal_type]));
-  const usedByType: Record<MealType, Set<number>> = { завтрак: new Set(), обед: new Set(), ужин: new Set() };
+// ---------- Гастрономическое разнообразие дня ----------
 
-  // Максимизируем уникальность: валидный и ещё не использованный id от LLM —
-  // принимаем; иначе берём первый неиспользованный id из пула; повторяем
-  // только когда пул того meal_type исчерпан целиком.
-  const pick = (value: unknown, type: MealType, index: number): number => {
-    const pool = mealPools[type];
-    const used = usedByType[type];
-    const numeric = Number(value);
+type DishInfo = { protein: string | null; side: string | null };
 
-    if (typeById.get(numeric) === type && pool.some((r) => r.id === numeric) && !used.has(numeric)) {
-      used.add(numeric);
-      return numeric;
+const PROTEIN_RULES: [RegExp, string][] = [
+  [/яйц/i, 'яйца'],
+  [/куриное филе|куриные|куриный/i, 'курица'],
+  [/говя/i, 'говядина'],
+  [/свинин/i, 'свинина'],
+  [/индейк/i, 'индейка'],
+  [/лосос|сёмг|треск|минтай|тунец/i, 'рыба'],
+  [/креветк|кальмар/i, 'морепродукты'],
+  [/тофу|нут|фасол|чечевиц/i, 'бобовые'],
+  [/творог/i, 'творог'],
+];
+
+const SIDE_RULES: [RegExp, string][] = [
+  [/гречк/i, 'гречка'],
+  [/рис/i, 'рис'],
+  [/макарон/i, 'макароны'],
+  [/картофел/i, 'картофель'],
+  [/булгур/i, 'булгур'],
+  [/кускус/i, 'кускус'],
+  [/киноа/i, 'киноа'],
+  [/хлеб|хлебцы|лаваш/i, 'хлеб'],
+  [/овсян/i, 'овсянка'],
+  [/манк/i, 'манка'],
+];
+
+/** Главный белок = группа с наибольшим вкладом белка (от 10 г на порцию);
+ *  гарнир = самая тяжёлая крахмальная позиция (от 40 г). */
+export function dishInfo(recipe: CatalogRecipe): DishInfo {
+  const proteinByGroup = new Map<string, number>();
+  let side: string | null = null;
+  let sideGrams = 0;
+
+  for (const ing of recipe.ingredients) {
+    const proteinRule = PROTEIN_RULES.find(([re]) => re.test(ing.name));
+    if (proteinRule) {
+      proteinByGroup.set(proteinRule[1], (proteinByGroup.get(proteinRule[1]) ?? 0) + (ing.protein || 0));
     }
-
-    const unused = pool.find((r) => !used.has(r.id));
-    if (unused) {
-      used.add(unused.id);
-      return unused.id;
+    const sideRule = SIDE_RULES.find(([re]) => re.test(ing.name));
+    if (sideRule && ing.grams >= 40 && ing.grams > sideGrams) {
+      side = sideRule[1];
+      sideGrams = ing.grams;
     }
+  }
 
-    if (pool.length) return pool[index % pool.length].id;
-
-    const anyOfType = catalog.filter((r) => r.meal_type === type);
-    if (anyOfType.length) {
-      console.warn(`Нет рецептов meal_type="${type}", подходящих под фильтры — используем весь каталог этого типа`);
-      return anyOfType[index % anyOfType.length].id;
+  let protein: string | null = null;
+  let best = 10;
+  for (const [group, value] of proteinByGroup) {
+    if (value >= best) {
+      protein = group;
+      best = value;
     }
-    return catalog[index % catalog.length]?.id;
-  };
+  }
+  return { protein, side };
+}
+
+/** Два блюда одного дня "конфликтуют", если у них одинаковый главный белок или гарнир. */
+export function clash(a: DishInfo | undefined, b: DishInfo | undefined): boolean {
+  if (!a || !b) return false;
+  return Boolean((a.protein && a.protein === b.protein) || (a.side && a.side === b.side));
+}
+
+function shuffle<T>(items: T[]): T[] {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy;
+}
+
+/** Строгий план недели: 21 разное блюдо, в каждом дне — разные главные белки и
+ *  гарниры (перебор с возвратом, подсказки LLM пробуются первыми). Если пулы
+ *  слишком малы для идеального плана — жадный запасной вариант, который
+ *  минимизирует повторы рецептов, а затем конфликты внутри дня. */
+function planWeek(rawDays: unknown, mealPools: Record<MealType, CatalogRecipe[]>, catalog: CatalogRecipe[]): MenuDay[] {
+  const info = new Map(catalog.map((r) => [r.id, dishInfo(r)]));
+  const poolIds = {} as Record<MealType, number[]>;
+  for (const type of MEAL_TYPES) {
+    const own = mealPools[type].length ? mealPools[type] : catalog.filter((r) => r.meal_type === type);
+    if (!mealPools[type].length) console.warn(`Нет рецептов meal_type="${type}" под фильтры — берём весь каталог типа`);
+    poolIds[type] = (own.length ? own : catalog).map((r) => r.id);
+  }
 
   const source = Array.isArray(rawDays) ? (rawDays as any[]) : [];
-  return WEEK_DAYS.map((day, index) => {
-    const row = source.find((item) => item?.day === day) ?? source[index] ?? {};
-    return {
-      day,
-      breakfastId: pick(row.breakfastId, 'завтрак', index),
-      lunchId: pick(row.lunchId, 'обед', index),
-      dinnerId: pick(row.dinnerId, 'ужин', index),
+  const hint = (type: MealType, day: number): number | undefined => {
+    const row = source.find((item) => item?.day === WEEK_DAYS[day]) ?? source[day];
+    const value = Number(type === 'завтрак' ? row?.breakfastId : type === 'обед' ? row?.lunchId : row?.dinnerId);
+    return poolIds[type].includes(value) ? value : undefined;
+  };
+
+  const strictPlan = (attempt: number): number[][] | null => {
+    const used = new Set<number>();
+    const plan: number[][] = [];
+    let work = 0;
+    const order = MEAL_TYPES.map((type) => (attempt === 0 ? poolIds[type] : shuffle(poolIds[type])));
+
+    const candidates = (typeIndex: number, day: number) => {
+      const free = order[typeIndex].filter((id) => !used.has(id));
+      const preferred = attempt === 0 ? hint(MEAL_TYPES[typeIndex], day) : undefined;
+      return preferred !== undefined && free.includes(preferred)
+        ? [preferred, ...free.filter((id) => id !== preferred)]
+        : free;
     };
-  });
+
+    const search = (day: number): boolean => {
+      if (day === 7) return true;
+      const breakfasts = candidates(0, day);
+      const lunches = candidates(1, day);
+      const dinners = candidates(2, day);
+      for (const b of breakfasts) {
+        for (const l of lunches) {
+          if (++work > 150000) return false;
+          if (clash(info.get(b), info.get(l))) continue;
+          for (const n of dinners) {
+            if (clash(info.get(b), info.get(n)) || clash(info.get(l), info.get(n))) continue;
+            used.add(b);
+            used.add(l);
+            used.add(n);
+            plan[day] = [b, l, n];
+            if (search(day + 1)) return true;
+            used.delete(b);
+            used.delete(l);
+            used.delete(n);
+            if (work > 150000) return false;
+          }
+        }
+      }
+      return false;
+    };
+
+    return search(0) ? plan : null;
+  };
+
+  let plan: number[][] | null = null;
+  if (MEAL_TYPES.every((type) => poolIds[type].length >= 7)) {
+    for (let attempt = 0; attempt < 30 && !plan; attempt += 1) plan = strictPlan(attempt);
+  }
+
+  if (!plan) {
+    const useCount = new Map<number, number>();
+    const uses = (id: number) => useCount.get(id) ?? 0;
+    plan = [];
+    for (let day = 0; day < 7; day += 1) {
+      let best: number[] = [poolIds.завтрак[0], poolIds.обед[0], poolIds.ужин[0]];
+      let bestScore = Infinity;
+      for (const b of poolIds.завтрак) {
+        for (const l of poolIds.обед) {
+          for (const n of poolIds.ужин) {
+            const reused = (uses(b) > 0 ? 1 : 0) + (uses(l) > 0 ? 1 : 0) + (uses(n) > 0 ? 1 : 0);
+            const clashes =
+              (clash(info.get(b), info.get(l)) ? 1 : 0) +
+              (clash(info.get(b), info.get(n)) ? 1 : 0) +
+              (clash(info.get(l), info.get(n)) ? 1 : 0);
+            const score = 100 * reused + uses(b) + uses(l) + uses(n) + 30 * clashes + Math.random();
+            if (score < bestScore) {
+              bestScore = score;
+              best = [b, l, n];
+            }
+          }
+        }
+      }
+      best.forEach((id) => useCount.set(id, uses(id) + 1));
+      plan.push(best);
+    }
+  }
+
+  return WEEK_DAYS.map((day, index) => ({
+    day,
+    breakfastId: plan![index][0],
+    lunchId: plan![index][1],
+    dinnerId: plan![index][2],
+  }));
 }
 
 // ---------- Агент 3: Закупщик ----------
@@ -360,6 +491,7 @@ function buildShoppingItems(
   catalog: CatalogRecipe[],
   storeProducts: StoreProductCompact[],
   fallbackStore: string,
+  portions: number,
 ): { items: ShoppingItem[]; totalCost: number } {
   const recipeById = new Map(catalog.map((r) => [r.id, r]));
   const counts = new Map<number, number>();
@@ -374,7 +506,7 @@ function buildShoppingItems(
     const recipe = recipeById.get(id);
     if (!recipe) continue;
     for (const ing of recipe.ingredients) {
-      gramsByName.set(ing.name, (gramsByName.get(ing.name) ?? 0) + ing.grams * times);
+      gramsByName.set(ing.name, (gramsByName.get(ing.name) ?? 0) + ing.grams * times * portions);
     }
   }
 
@@ -465,6 +597,7 @@ export async function generateMenuWithAgents(
     catalog,
     storeProducts,
     profile.pricing_store,
+    Math.max(1, Math.round(profile.portions ?? 1)),
   );
   const nutrition = computeNutrition(days, catalog);
   const stores = [...new Set(items.map((item) => item.store))];
@@ -481,15 +614,19 @@ export async function generateMenuWithAgents(
   };
 }
 
-/** Для кнопки «Изменить блюдо»: подбирает один рецепт того же meal_type,
- *  которого ещё нет в excludeIds (остальные блюда текущей недели), строго
- *  по тем же diet/equipment фильтрам. Повторяет уже использованный id,
- *  только если в каталоге действительно больше нечего предложить. */
+/** Для кнопки «Изменить блюдо». Уровни выбора (первый непустой):
+ *  1) не использовано на неделе и не отвергнуто пользователем;
+ *  2) повтор из этой недели, но не отвергнутое;
+ *  3) пул исчерпан — можно вернуть и отвергнутое.
+ *  Внутри уровня предпочитаем блюда, не конфликтующие с соседями дня
+ *  (siblingIds) по белку/гарниру. Фильтры diet/equipment строгие. */
 export function pickReplacementRecipe(
   profile: AgentProfile,
   catalog: CatalogRecipe[],
   mealType: MealType,
-  excludeIds: number[],
+  usedIds: number[],
+  rejectedIds: number[] = [],
+  siblingIds: number[] = [],
 ): number | null {
   const allowedIds = new Set(filterByDiet(catalog, profile.diet_tags));
   const byDiet = catalog.filter((r) => r.meal_type === mealType && allowedIds.has(r.id));
@@ -497,8 +634,27 @@ export function pickReplacementRecipe(
   const pool = byEquip.length ? byEquip : byDiet;
   if (!pool.length) return null;
 
-  const exclude = new Set(excludeIds);
-  const unused = pool.filter((r) => !exclude.has(r.id));
-  const candidates = unused.length ? unused : pool;
-  return candidates[Math.floor(Math.random() * candidates.length)].id;
+  const used = new Set(usedIds);
+  const rejected = new Set(rejectedIds);
+  const siblings = siblingIds
+    .map((id) => catalog.find((r) => r.id === id))
+    .filter((r): r is CatalogRecipe => Boolean(r))
+    .map(dishInfo);
+  const diverse = (r: CatalogRecipe) => !siblings.some((s) => clash(dishInfo(r), s));
+  const pickOne = (items: CatalogRecipe[]) => items[Math.floor(Math.random() * items.length)].id;
+
+  const tiers = [
+    pool.filter((r) => !used.has(r.id) && !rejected.has(r.id)),
+    pool.filter((r) => !rejected.has(r.id)),
+    pool,
+  ];
+
+  for (const tier of tiers) {
+    const good = tier.filter(diverse);
+    if (good.length) return pickOne(good);
+  }
+  for (const tier of tiers) {
+    if (tier.length) return pickOne(tier);
+  }
+  return null;
 }

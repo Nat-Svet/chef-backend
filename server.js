@@ -129,6 +129,7 @@ async function loadProfileAndCatalog(userId) {
     pricing_store: activeStore,
     // MVP: ровно одна главная цель рациона (старые профили с несколькими — берём первую)
     diet_tags: (profileResult.data.diet_tags || []).slice(0, 1),
+    portions: 1,
     equipment_tags: profileResult.data.equipment_tags || [],
   };
 
@@ -160,6 +161,7 @@ app.post('/api/generate-menu', async (req, res) => {
       return res.status(loaded.error.status).json({ error: loaded.error.message });
     }
     const { profile, catalog, storeProducts } = loaded;
+    profile.portions = Math.min(20, Math.max(1, Math.round(Number(req.body?.portions) || 1)));
 
     let menu;
     let isFallback = false;
@@ -192,7 +194,7 @@ app.post('/api/generate-menu', async (req, res) => {
 });
 
 app.post('/api/regenerate-meal', async (req, res) => {
-  const { userId, mealType, excludeIds } = req.body || {};
+  const { userId, mealType, excludeIds, rejectedIds, siblingIds } = req.body || {};
 
   if (!userId || typeof userId !== 'string') {
     return res.status(400).json({ error: 'Передайте { userId }' });
@@ -211,7 +213,15 @@ app.post('/api/regenerate-meal', async (req, res) => {
     }
 
     const exclude = Array.isArray(excludeIds) ? excludeIds.map(Number).filter(Number.isFinite) : [];
-    const recipeId = pickReplacementRecipe(loaded.profile, loaded.catalog, mealType, exclude);
+    const toIds = (list) => (Array.isArray(list) ? list.map(Number).filter(Number.isFinite) : []);
+    const recipeId = pickReplacementRecipe(
+      loaded.profile,
+      loaded.catalog,
+      mealType,
+      exclude,
+      toIds(rejectedIds),
+      toIds(siblingIds),
+    );
 
     if (recipeId === null) {
       return res.status(409).json({ error: 'Нет подходящих блюд под текущие фильтры' });
