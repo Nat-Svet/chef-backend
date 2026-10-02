@@ -359,7 +359,6 @@ function buildShoppingItems(
   days: MenuDay[],
   catalog: CatalogRecipe[],
   storeProducts: StoreProductCompact[],
-  budgetLimit: number,
   fallbackStore: string,
 ): { items: ShoppingItem[]; totalCost: number } {
   const recipeById = new Map(catalog.map((r) => [r.id, r]));
@@ -379,9 +378,8 @@ function buildShoppingItems(
     }
   }
 
-  // Если выбрано несколько магазинов, storeProducts содержит товары сразу
-  // по всем — среди совпадений по названию берём самый дешёвый за грамм,
-  // чтобы Закупщик реально оптимизировал корзину по выгоде между сетями.
+  // storeProducts — каталог ОДНОГО магазина. Если в нём несколько позиций с одним
+  // названием, берём самую дешёвую за грамм.
   const matchProduct = (name: string) => {
     const needle = name.toLowerCase();
     const candidates = storeProducts.filter(
@@ -406,17 +404,10 @@ function buildShoppingItems(
     return { name, grams, category: guessCategory(name), price, store: product?.store ?? fallbackStore };
   });
 
-  const rawTotal = raw.reduce((sum, item) => sum + item.price, 0) || 1;
-  const target = budgetLimit > 0 ? Math.min(Math.round(rawTotal), budgetLimit) : Math.round(rawTotal);
-
+  // Стоимость — ровно по каталогу магазина: упаковки × цена, без подгонки под бюджет.
   const items = raw
-    .map((item) => ({ ...item, price: Math.max(1, Math.round((item.price / rawTotal) * target)) }))
-    .sort((a, b) => a.name.localeCompare(b.name, 'ru'));
-
-  const drift = target - items.reduce((sum, item) => sum + item.price, 0);
-  if (items.length && drift !== 0) {
-    items[items.length - 1].price = Math.max(1, items[items.length - 1].price + drift);
-  }
+    .map((item) => ({ ...item, price: Math.max(1, Math.round(item.price)) }))
+    .sort((x, y) => x.name.localeCompare(y.name, 'ru'));
 
   const totalCost = items.reduce((sum, item) => sum + item.price, 0);
   return { items, totalCost };
@@ -473,7 +464,6 @@ export async function generateMenuWithAgents(
     days,
     catalog,
     storeProducts,
-    profile.budget_limit,
     profile.pricing_store,
   );
   const nutrition = computeNutrition(days, catalog);

@@ -101,9 +101,9 @@ async function loadProfileAndCatalog(userId) {
       })),
   }));
 
-  // Если выбрано несколько магазинов — тянем товары сразу по всем, чтобы
-  // Закупщик мог сравнивать цены между сетями и выбирать выгоднее.
-  const selectedStores = profileResult.data.selected_stores?.length ? profileResult.data.selected_stores : ['Самокат'];
+  // MVP: один магазин. Берём первый (единственный) выбранный; если у него нет
+  // товаров в каталоге — запасной вариант Самокат, чтобы корзина не осталась пустой.
+  const selectedStore = profileResult.data.selected_stores?.[0] || 'Самокат';
   const compactProducts = (item) => ({
     store: item.store_name,
     search_term: item.search_term,
@@ -112,31 +112,21 @@ async function loadProfileAndCatalog(userId) {
     pack_g: item.pack_weight_grams,
   });
   const inStock = (item) => item.in_stock !== false;
+  const productsOf = (store) =>
+    (productsResult.data || []).filter((item) => item.store_name === store && inStock(item)).map(compactProducts);
 
-  let storeProducts = (productsResult.data || [])
-    .filter((item) => selectedStores.includes(item.store_name) && inStock(item))
-    .map(compactProducts);
-  let activeStores = selectedStores;
-
-  if (storeProducts.length === 0) {
-    const samokat = (productsResult.data || [])
-      .filter((item) => item.store_name === 'Самокат' && inStock(item))
-      .map(compactProducts);
-    if (samokat.length) {
-      storeProducts = samokat;
-      activeStores = ['Самокат'];
-    } else {
-      storeProducts = (productsResult.data || []).filter(inStock).map(compactProducts);
-      activeStores = [...new Set(storeProducts.map((p) => p.store))];
-      if (!activeStores.length) activeStores = selectedStores;
-    }
+  let activeStore = selectedStore;
+  let storeProducts = productsOf(selectedStore);
+  if (storeProducts.length === 0 && selectedStore !== 'Самокат') {
+    activeStore = 'Самокат';
+    storeProducts = productsOf('Самокат');
   }
 
   const profile = {
     id: profileResult.data.id,
     budget_limit: Number(profileResult.data.budget_limit),
-    selected_stores: profileResult.data.selected_stores || [],
-    pricing_store: activeStores[0] || 'Самокат',
+    selected_stores: [activeStore],
+    pricing_store: activeStore,
     diet_tags: profileResult.data.diet_tags || [],
     equipment_tags: profileResult.data.equipment_tags || [],
   };
