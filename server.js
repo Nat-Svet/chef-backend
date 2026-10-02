@@ -127,7 +127,8 @@ async function loadProfileAndCatalog(userId) {
     budget_limit: Number(profileResult.data.budget_limit),
     selected_stores: [activeStore],
     pricing_store: activeStore,
-    diet_tags: profileResult.data.diet_tags || [],
+    // MVP: ровно одна главная цель рациона (старые профили с несколькими — берём первую)
+    diet_tags: (profileResult.data.diet_tags || []).slice(0, 1),
     equipment_tags: profileResult.data.equipment_tags || [],
   };
 
