@@ -78,7 +78,8 @@ async function loadProfileAndCatalog(userId) {
     return { error: { status: 404, message: 'Профиль не найден' } };
   }
 
-  const recipes = recipesResult.data || [];
+  // Продуктовое решение: «Без готовки» убрано — такие рецепты в подбор не попадают.
+  const recipes = (recipesResult.data || []).filter((recipe) => !(recipe.tags || []).includes('Без готовки'));
   if (recipes.length === 0) {
     return { error: { status: 409, message: 'В таблице recipes нет блюд. Запустите npm run seed:recipes' } };
   }

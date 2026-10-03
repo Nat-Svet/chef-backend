@@ -75,7 +75,7 @@ export type GeneratedMenuPayload = {
 };
 
 const WEEK_DAYS: WeekDay[] = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
-const NO_COOK = 'Без готовки';
+/** Снятый с продукта тег: рецепты с ним в меню не попадают (см. server.js). */
 const EQUIPMENT = [
   'Плита',
   'Духовка',
@@ -84,7 +84,6 @@ const EQUIPMENT = [
   'Блендер / Миксер',
   'Электрогриль / Аэрогриль',
   'Тостер',
-  NO_COOK,
 ];
 
 const DEEPSEEK_URL = (process.env.TIMEWEB_AI_URL || 'https://api.timeweb.ai/v1').replace(/\/$/, '');
@@ -269,9 +268,9 @@ days — ровно 7 объектов, day строго: Пн, Вт, Ср, Чт
 }
 
 /** Блюдо подходит, если у пользователя есть ВСЯ нужная ему техника (рецепт
- *  может требовать сразу плиту и блендер). «Без готовки» техники не требует. */
+ *  может требовать сразу плиту и блендер). */
 function isEquipmentCompatible(recipe: CatalogRecipe, equipmentTags: string[]): boolean {
-  const required = recipe.tags.filter((tag) => EQUIPMENT.includes(tag) && tag !== NO_COOK);
+  const required = recipe.tags.filter((tag) => EQUIPMENT.includes(tag));
   return required.every((tag) => equipmentTags.includes(tag));
 }
 
